@@ -31,7 +31,18 @@ import {
 } from 'lucide-react'
 import './App.css'
 import { communities, mockForms, users } from './data/mockData'
-import type { DraftFormInput, FormRecord, SyncStatus, UserProfile } from './types'
+import {
+  createSupabaseProfile,
+  fetchSupabaseCommunities,
+  fetchSupabaseForms,
+  fetchSupabaseProfiles,
+  isSupabaseConfigured,
+  signInWithUsernamePassword,
+  signOutSupabase,
+  syncFormToSupabase,
+  updateSupabaseProfile,
+} from './lib/supabase'
+import type { Community, DraftFormInput, FormRecord, SyncStatus, UserProfile } from './types'
 
 const LOCAL_FORMS_KEY = 'paf-local-collections'
 const ACCESS_USERS_KEY = 'paf-access-users'
@@ -104,6 +115,11 @@ function App() {
     window.localStorage.setItem(ACCESS_USERS_KEY, JSON.stringify(accessUsers))
   }, [accessUsers])
 
+  const logout = () => {
+    void signOutSupabase()
+    setSession(null)
+  }
+
   if (!session) {
     return <LoginScreen accessUsers={accessUsers} onLogin={setSession} />
   }
@@ -111,13 +127,13 @@ function App() {
   return (
     <main className="app-shell">
       {session.role === 'collector' ? (
-        <CollectorApp user={session} onLogout={() => setSession(null)} />
+        <CollectorApp user={session} onLogout={logout} />
       ) : (
         <AdminDashboard
           accessUsers={accessUsers}
           onAccessUsersChange={setAccessUsers}
           user={session}
-          onLogout={() => setSession(null)}
+          onLogout={logout}
         />
       )}
     </main>
@@ -136,10 +152,28 @@ function LoginScreen({
   const [username, setUsername] = useState(firstCollector?.username ?? '')
   const [password, setPassword] = useState('demo123')
   const [error, setError] = useState('')
+  const [loggingIn, setLoggingIn] = useState(false)
 
-  const submit = (event: React.FormEvent<HTMLFormElement>) => {
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const normalizedUsername = username.trim().toLowerCase()
+
+    if (isSupabaseConfigured) {
+      setLoggingIn(true)
+      setError('')
+
+      try {
+        const profile = await signInWithUsernamePassword(normalizedUsername, password)
+        onLogin(profile)
+      } catch {
+        setError('Usuario ou senha invalido no Supabase')
+      } finally {
+        setLoggingIn(false)
+      }
+
+      return
+    }
+
     const found = accessUsers.find((item) => item.username.toLowerCase() === normalizedUsername)
 
     if (!found || password !== found.password) {
@@ -175,6 +209,7 @@ function LoginScreen({
               onChange={(event) => setUsername(event.target.value)}
               placeholder="ana, carlos, admin"
               value={username}
+              disabled={loggingIn}
             />
           </label>
 
@@ -185,27 +220,30 @@ function LoginScreen({
               onChange={(event) => setPassword(event.target.value)}
               type="password"
               value={password}
+              disabled={loggingIn}
             />
           </label>
 
           {error ? <p className="form-error">{error}</p> : null}
 
-          <button className="primary-button" type="submit">
+          <button className="primary-button" disabled={loggingIn} type="submit">
             <Lock aria-hidden="true" size={18} />
-            Entrar
+            {loggingIn ? 'Entrando' : 'Entrar'}
           </button>
         </form>
 
-        <div className="demo-access" aria-label="Acessos de demonstracao">
-          <button disabled={!firstCollector} type="button" onClick={() => firstCollector && onLogin(firstCollector)}>
-            <Smartphone aria-hidden="true" size={18} />
-            Coletor
-          </button>
-          <button disabled={!firstAdmin} type="button" onClick={() => firstAdmin && onLogin(firstAdmin)}>
-            <Monitor aria-hidden="true" size={18} />
-            Admin
-          </button>
-        </div>
+        {!isSupabaseConfigured ? (
+          <div className="demo-access" aria-label="Acessos de demonstracao">
+            <button disabled={!firstCollector} type="button" onClick={() => firstCollector && onLogin(firstCollector)}>
+              <Smartphone aria-hidden="true" size={18} />
+              Coletor
+            </button>
+            <button disabled={!firstAdmin} type="button" onClick={() => firstAdmin && onLogin(firstAdmin)}>
+              <Monitor aria-hidden="true" size={18} />
+              Admin
+            </button>
+          </div>
+        ) : null}
 
         <DevSignature />
       </section>
@@ -217,6 +255,7 @@ function CollectorApp({ user, onLogout }: { user: UserProfile; onLogout: () => v
   const [activeTab, setActiveTab] = useState<'home' | 'form' | 'sync'>('home')
   const [formStep, setFormStep] = useState(0)
   const formSectionRef = useRef<HTMLElement | null>(null)
+  const [availableCommunities, setAvailableCommunities] = useState<Community[]>(communities)
   const [draft, setDraft] = useState<DraftFormInput>(emptyDraft)
   const [collections, setCollections] = useState<FormRecord[]>(() => loadLocalForms(user))
   const [gps, setGps] = useState({
@@ -231,6 +270,48 @@ function CollectorApp({ user, onLogout }: { user: UserProfile; onLogout: () => v
   useEffect(() => {
     persistLocalForms(user, collections)
   }, [collections, user])
+
+  useEffect(() => {
+    if (!isSupabaseConfigured) {
+      return
+    }
+
+    let cancelled = false
+
+    const loadRemoteData = async () => {
+      try {
+        const [remoteCommunities, remoteForms] = await Promise.all([
+          fetchSupabaseCommunities(),
+          fetchSupabaseForms(),
+        ])
+
+        if (cancelled) {
+          return
+        }
+
+        if (remoteCommunities.length > 0) {
+          setAvailableCommunities(remoteCommunities)
+          setDraft((current) => {
+            if (remoteCommunities.some((item) => item.id === current.communityId)) {
+              return current
+            }
+
+            return draftFromCommunity(remoteCommunities[0], current)
+          })
+        }
+
+        setCollections(remoteForms)
+      } catch (error) {
+        console.error('Falha ao carregar dados do Supabase', error)
+      }
+    }
+
+    void loadRemoteData()
+
+    return () => {
+      cancelled = true
+    }
+  }, [user.id])
 
   useEffect(() => {
     const handleOnline = () => setOnline(true)
@@ -281,7 +362,7 @@ function CollectorApp({ user, onLogout }: { user: UserProfile; onLogout: () => v
   }
 
   const updateCommunity = (communityId: string) => {
-    const community = communities.find((item) => item.id === communityId) ?? communities[0]
+    const community = availableCommunities.find((item) => item.id === communityId) ?? availableCommunities[0]
     setDraft((current) => ({
       ...current,
       communityId: community.id,
@@ -386,6 +467,31 @@ function CollectorApp({ user, onLogout }: { user: UserProfile; onLogout: () => v
   }
 
   const syncPending = () => {
+    if (isSupabaseConfigured) {
+      setSyncing(true)
+
+      void (async () => {
+        const pending = collections.filter(
+          (item) => item.syncStatus === 'pending_sync' || item.syncStatus === 'sync_error',
+        )
+        const synced = new Map<string, FormRecord>()
+
+        for (const item of pending) {
+          try {
+            synced.set(item.id, await syncFormToSupabase(item))
+          } catch (error) {
+            console.error('Falha ao sincronizar coleta no Supabase', error)
+            synced.set(item.id, { ...item, syncStatus: 'sync_error' })
+          }
+        }
+
+        setCollections((current) => current.map((item) => synced.get(item.id) ?? item))
+        setSyncing(false)
+      })()
+
+      return
+    }
+
     setSyncing(true)
     window.setTimeout(() => {
       setCollections((current) =>
@@ -544,7 +650,7 @@ function CollectorApp({ user, onLogout }: { user: UserProfile; onLogout: () => v
                   <label>
                     Comunidade
                     <select value={draft.communityId} onChange={(event) => updateCommunity(event.target.value)}>
-                      {communities.map((community) => (
+                      {availableCommunities.map((community) => (
                         <option key={community.id} value={community.id}>
                           {community.name}
                         </option>
@@ -863,27 +969,76 @@ function AdminDashboard({
   const [collector, setCollector] = useState('Todos')
   const [status, setStatus] = useState('Todos')
   const [accessMessage, setAccessMessage] = useState('')
+  const [dashboardForms, setDashboardForms] = useState<FormRecord[]>(mockForms)
+  const [dashboardCommunities, setDashboardCommunities] = useState<Community[]>(communities)
+  const [remoteAccessUsers, setRemoteAccessUsers] = useState<AccessProfile[] | null>(null)
   const [newAccess, setNewAccess] = useState({
     name: '',
     username: '',
     role: 'collector' as UserProfile['role'],
   })
 
-  const collectors = accessUsers.filter((item) => item.role === 'collector')
+  useEffect(() => {
+    if (!isSupabaseConfigured) {
+      return
+    }
+
+    let cancelled = false
+
+    const loadDashboardData = async () => {
+      try {
+        const [remoteForms, remoteCommunities, remoteProfiles] = await Promise.all([
+          fetchSupabaseForms(),
+          fetchSupabaseCommunities(),
+          fetchSupabaseProfiles(),
+        ])
+
+        if (cancelled) {
+          return
+        }
+
+        setDashboardForms(remoteForms)
+        setDashboardCommunities(remoteCommunities)
+        setRemoteAccessUsers(remoteProfiles.map(accessProfileFromUserProfile))
+      } catch (error) {
+        console.error('Falha ao carregar dashboard do Supabase', error)
+        setAccessMessage('Nao foi possivel carregar dados do Supabase')
+      }
+    }
+
+    void loadDashboardData()
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const displayAccessUsers = remoteAccessUsers ?? accessUsers
+  const updateDisplayAccessUsers: React.Dispatch<React.SetStateAction<AccessProfile[]>> = (next) => {
+    if (remoteAccessUsers) {
+      setRemoteAccessUsers((current) =>
+        typeof next === 'function' ? next(current ?? []) : next,
+      )
+      return
+    }
+
+    onAccessUsersChange(next)
+  }
+  const collectors = displayAccessUsers.filter((item) => item.role === 'collector')
   const accessStats = useMemo(
     () => ({
-      mobile: accessUsers.filter((item) => item.role === 'collector').length,
-      dashboard: accessUsers.filter((item) => item.role === 'admin').length,
-      active: accessUsers.filter((item) => item.active).length,
-      temporaryPasswords: accessUsers.filter((item) => item.passwordStatus === 'Temporaria').length,
+      mobile: displayAccessUsers.filter((item) => item.role === 'collector').length,
+      dashboard: displayAccessUsers.filter((item) => item.role === 'admin').length,
+      active: displayAccessUsers.filter((item) => item.active).length,
+      temporaryPasswords: displayAccessUsers.filter((item) => item.passwordStatus === 'Temporaria').length,
     }),
-    [accessUsers],
+    [displayAccessUsers],
   )
 
   const filteredForms = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase()
 
-    return mockForms.filter((item) => {
+    return dashboardForms.filter((item) => {
       const matchesQuery =
         !normalizedQuery ||
         [item.communityName, item.collectorName, item.municipality, item.association]
@@ -897,7 +1052,7 @@ function AdminDashboard({
 
       return matchesQuery && matchesCommunity && matchesCollector && matchesStatus
     })
-  }, [collector, community, query, status])
+  }, [collector, community, dashboardForms, query, status])
 
   const metrics = useMemo(() => {
     const photos = filteredForms.reduce((sum, item) => sum + item.photos.length, 0)
@@ -909,16 +1064,16 @@ function AdminDashboard({
   }, [filteredForms])
 
   const communityBars = useMemo(() => {
-    return communities.map((item) => ({
+    return dashboardCommunities.map((item) => ({
       name: item.name,
       count: filteredForms.filter((form) => form.communityId === item.id).length,
     }))
-  }, [filteredForms])
+  }, [dashboardCommunities, filteredForms])
 
   const maxCommunityCount = Math.max(...communityBars.map((item) => item.count), 1)
 
   const updateAccessUser = (id: string, patch: Partial<AccessProfile>) => {
-    onAccessUsersChange((current) =>
+    updateDisplayAccessUsers((current) =>
       current.map((item) => {
         if (item.id !== id) {
           return item
@@ -933,9 +1088,26 @@ function AdminDashboard({
         }
       }),
     )
+
+    if (isSupabaseConfigured && (patch.role || typeof patch.active === 'boolean')) {
+      const supabasePatch: Partial<Pick<AccessProfile, 'active' | 'role'>> = {}
+
+      if (patch.role) {
+        supabasePatch.role = patch.role
+      }
+
+      if (typeof patch.active === 'boolean') {
+        supabasePatch.active = patch.active
+      }
+
+      void updateSupabaseProfile(id, supabasePatch).catch((error) => {
+        console.error('Falha ao atualizar perfil no Supabase', error)
+        setAccessMessage('Nao foi possivel atualizar o perfil no Supabase')
+      })
+    }
   }
 
-  const createAccessUser = (event: React.FormEvent<HTMLFormElement>) => {
+  const createAccessUser = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const normalizedUsername = normalizeUsername(newAccess.username)
 
@@ -944,8 +1116,30 @@ function AdminDashboard({
       return
     }
 
-    if (accessUsers.some((item) => item.username.toLowerCase() === normalizedUsername)) {
+    if (displayAccessUsers.some((item) => item.username.toLowerCase() === normalizedUsername)) {
       setAccessMessage('Ja existe acesso com esse usuario')
+      return
+    }
+
+    if (isSupabaseConfigured) {
+      try {
+        const profile = await createSupabaseProfile({
+          name: newAccess.name.trim(),
+          username: normalizedUsername,
+          role: newAccess.role,
+        })
+        const createdUser = accessProfileFromUserProfile(profile)
+
+        updateDisplayAccessUsers((current) => [...current, createdUser])
+        setAccessMessage(
+          `Perfil criado no Supabase. Crie o usuario Auth ${normalizedUsername}@paf.local e vincule em profiles.auth_user_id.`,
+        )
+        setNewAccess({ name: '', username: '', role: 'collector' })
+      } catch (error) {
+        console.error('Falha ao criar perfil no Supabase', error)
+        setAccessMessage('Nao foi possivel criar o perfil no Supabase')
+      }
+
       return
     }
 
@@ -964,14 +1158,22 @@ function AdminDashboard({
       temporaryPassword,
     }
 
-    onAccessUsersChange((current) => [...current, createdUser])
+    updateDisplayAccessUsers((current) => [...current, createdUser])
     setAccessMessage(`Senha temporaria de ${createdUser.name}: ${temporaryPassword}`)
     setNewAccess({ name: '', username: '', role: 'collector' })
   }
 
   const resetPassword = (id: string) => {
+    if (isSupabaseConfigured) {
+      const targetUser = displayAccessUsers.find((item) => item.id === id)
+      setAccessMessage(
+        `Reset real de senha deve ser feito no Supabase Auth para ${targetUser?.username ?? 'usuario'}@paf.local.`,
+      )
+      return
+    }
+
     const temporaryPassword = generateTemporaryPassword()
-    const targetUser = accessUsers.find((item) => item.id === id)
+    const targetUser = displayAccessUsers.find((item) => item.id === id)
 
     updateAccessUser(id, {
       password: temporaryPassword,
@@ -1063,7 +1265,7 @@ function AdminDashboard({
               Formularios
             </span>
             <span>
-              <strong>{communities.length}</strong>
+              <strong>{dashboardCommunities.length}</strong>
               Comunidades
             </span>
             <span>
@@ -1092,7 +1294,7 @@ function AdminDashboard({
             <Filter aria-hidden="true" size={17} />
             <select value={community} onChange={(event) => setCommunity(event.target.value)}>
               <option>Todas</option>
-              {communities.map((item) => (
+              {dashboardCommunities.map((item) => (
                 <option key={item.id}>{item.name}</option>
               ))}
             </select>
@@ -1213,7 +1415,7 @@ function AdminDashboard({
           </div>
           <div className="collector-admin-list">
             {collectors.map((collectorUser) => {
-              const total = mockForms.filter((item) => item.userId === collectorUser.id).length
+              const total = dashboardForms.filter((item) => item.userId === collectorUser.id).length
               return (
                 <div className="collector-admin-row" key={collectorUser.id}>
                   <span>
@@ -1319,7 +1521,7 @@ function AdminDashboard({
                 </tr>
               </thead>
               <tbody>
-                {accessUsers.map((accessUser) => (
+                {displayAccessUsers.map((accessUser) => (
                   <tr key={accessUser.id}>
                     <td>
                       <strong>{accessUser.name}</strong>
@@ -1672,6 +1874,26 @@ function normalizeAccessUser(item: Partial<AccessProfile>): AccessProfile {
     passwordStatus: item.passwordStatus ?? 'Ativa',
     passwordUpdatedAt: item.passwordUpdatedAt ?? new Date().toISOString(),
     temporaryPassword: item.temporaryPassword,
+  }
+}
+
+function draftFromCommunity(community: Community, current: DraftFormInput = emptyDraft): DraftFormInput {
+  return {
+    ...current,
+    communityId: community.id,
+    communityName: community.name,
+    municipality: community.municipality,
+    association: community.association,
+  }
+}
+
+function accessProfileFromUserProfile(item: UserProfile): AccessProfile {
+  return {
+    ...item,
+    accessTarget: accessTargetForRole(item.role),
+    password: 'Supabase Auth',
+    passwordStatus: 'Ativa',
+    passwordUpdatedAt: new Date().toISOString(),
   }
 }
 
